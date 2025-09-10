@@ -1,4 +1,4 @@
-Free Download Manager (FDM) - Enhanced Version
+Free/Fast Download Manager 
 Overview
 
 A feature-rich download manager built with Python and Tkinter that supports resume functionality, database tracking, and a modern user interface.
