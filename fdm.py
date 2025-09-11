@@ -15,16 +15,30 @@ from PIL import Image, ImageDraw
 import io
 import sqlite3
 import argparse
+import logging
+import tempfile
 
 # Constants
-DEFAULT_CHUNK_SIZE = 8192
+DEFAULT_CHUNK_SIZE = 65536
 MAX_CONNECTIONS = 8
 CONFIG_FILE = "downloader_config.json"
 DB_FILE = "downloads.db"
 
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler("fdm.log")
+    ]
+)
+logger = logging.getLogger(__name__)
+
 class DownloadDB:
     def __init__(self):
         self.conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+        self.conn.execute("PRAGMA journal_mode=WAL")  # Better concurrency
         self.create_tables()
         
     def create_tables(self):
@@ -70,10 +84,35 @@ class DownloadDB:
             )
         ''')
         
+        # Settings table to replace JSON config
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS settings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                key TEXT UNIQUE NOT NULL,
+                value TEXT NOT NULL
+            )
+        ''')
+        
         # Initialize stats if empty
         cursor.execute("SELECT COUNT(*) FROM stats")
         if cursor.fetchone()[0] == 0:
             cursor.execute("INSERT INTO stats (total_downloads, total_downloaded_bytes) VALUES (0, 0)")
+            
+        # Initialize default settings
+        default_settings = [
+            ('save_path', os.path.join(os.path.expanduser("~"), "Downloads")),
+            ('max_connections', str(MAX_CONNECTIONS)),
+            ('chunk_size', str(DEFAULT_CHUNK_SIZE)),
+            ('timeout', '30'),
+            ('theme', 'light'),
+            ('proxy', '')
+        ]
+        
+        for key, value in default_settings:
+            cursor.execute(
+                "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
+                (key, value)
+            )
             
         self.conn.commit()
         
@@ -89,54 +128,68 @@ class DownloadDB:
     def update_download_progress(self, download_id, downloaded, total_size, status, speed=0):
         cursor = self.conn.cursor()
         
-        # Update download record
-        cursor.execute(
-            "UPDATE downloads SET downloaded = ?, total_size = ?, status = ? WHERE id = ?",
-            (downloaded, total_size, status, download_id)
-        )
+        # Start a transaction
+        cursor.execute("BEGIN TRANSACTION")
         
-        # Update or create download session
-        cursor.execute(
-            "SELECT id FROM download_sessions WHERE download_id = ? AND end_time IS NULL",
-            (download_id,)
-        )
-        session = cursor.fetchone()
-        
-        if session:
-            session_id = session[0]
+        try:
+            # Update download record
             cursor.execute(
-                "UPDATE download_sessions SET downloaded_bytes = ?, average_speed = ? WHERE id = ?",
-                (downloaded, speed, session_id)
-            )
-        else:
-            cursor.execute(
-                "INSERT INTO download_sessions (download_id, downloaded_bytes, average_speed) VALUES (?, ?, ?)",
-                (download_id, downloaded, speed)
+                "UPDATE downloads SET downloaded = ?, total_size = ?, status = ? WHERE id = ?",
+                (downloaded, total_size, status, download_id)
             )
             
-        self.conn.commit()
+            # Update or create download session
+            cursor.execute(
+                "SELECT id FROM download_sessions WHERE download_id = ? AND end_time IS NULL",
+                (download_id,)
+            )
+            session = cursor.fetchone()
+            
+            if session:
+                session_id = session[0]
+                cursor.execute(
+                    "UPDATE download_sessions SET downloaded_bytes = ?, average_speed = ? WHERE id = ?",
+                    (downloaded, speed, session_id)
+                )
+            else:
+                cursor.execute(
+                    "INSERT INTO download_sessions (download_id, downloaded_bytes, average_speed) VALUES (?, ?, ?)",
+                    (download_id, downloaded, speed)
+                )
+                
+            self.conn.commit()
+        except Exception as e:
+            self.conn.rollback()
+            raise e
         
     def complete_download(self, download_id, average_speed):
         cursor = self.conn.cursor()
         
-        # Update download record
-        cursor.execute(
-            "UPDATE downloads SET status = 'completed', completed_date = CURRENT_TIMESTAMP, average_speed = ? WHERE id = ?",
-            (average_speed, download_id)
-        )
+        # Start a transaction
+        cursor.execute("BEGIN TRANSACTION")
         
-        # End the download session
-        cursor.execute(
-            "UPDATE download_sessions SET end_time = CURRENT_TIMESTAMP WHERE download_id = ? AND end_time IS NULL",
-            (download_id,)
-        )
-        
-        # Update stats
-        cursor.execute(
-            "UPDATE stats SET total_downloads = total_downloads + 1, last_updated = CURRENT_TIMESTAMP"
-        )
-        
-        self.conn.commit()
+        try:
+            # Update download record
+            cursor.execute(
+                "UPDATE downloads SET status = 'completed', completed_date = CURRENT_TIMESTAMP, average_speed = ? WHERE id = ?",
+                (average_speed, download_id)
+            )
+            
+            # End the download session
+            cursor.execute(
+                "UPDATE download_sessions SET end_time = CURRENT_TIMESTAMP WHERE download_id = ? AND end_time IS NULL",
+                (download_id,)
+            )
+            
+            # Update stats
+            cursor.execute(
+                "UPDATE stats SET total_downloads = total_downloads + 1, last_updated = CURRENT_TIMESTAMP"
+            )
+            
+            self.conn.commit()
+        except Exception as e:
+            self.conn.rollback()
+            raise e
         
     def get_download_history(self):
         cursor = self.conn.cursor()
@@ -161,11 +214,25 @@ class DownloadDB:
         cursor = self.conn.cursor()
         cursor.execute("UPDATE stats SET average_speed = ?", (average_speed,))
         self.conn.commit()
+    
+    def get_setting(self, key):
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
+        result = cursor.fetchone()
+        return result[0] if result else None
+    
+    def set_setting(self, key, value):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+            (key, str(value))
+        )
+        self.conn.commit()
 
 
 class DownloadThread(threading.Thread):
     def __init__(self, url, file_path, start_byte, end_byte, progress_callback, 
-                 complete_callback, error_callback, headers=None, timeout=30, db_id=None, db_manager=None):
+                 complete_callback, error_callback, headers=None, timeout=30, db_id=None, db_manager=None, chunk_size_setting=DEFAULT_CHUNK_SIZE):
         super().__init__()
         self.url = url
         self.file_path = file_path
@@ -186,6 +253,10 @@ class DownloadThread(threading.Thread):
         self.db_id = db_id
         self.db_manager = db_manager
         self.speed_samples = []  # For calculating average speed
+        self.retry_count = 0
+        self.max_retries = 5
+        self.chunk_size_setting = chunk_size_setting
+        logger.info(f"Download thread created for {url} with chunk size setting: {chunk_size_setting}")
         
     def run(self):
         try:
@@ -193,8 +264,10 @@ class DownloadThread(threading.Thread):
             range_header = f'bytes={self.start_byte + self.downloaded}-{self.end_byte}'
             self.headers['Range'] = range_header
             
-            response = requests.get(self.url, headers=self.headers, stream=True, 
-                                  timeout=self.timeout, allow_redirects=True)
+            # Use a session for better connection management
+            session = requests.Session()
+            response = session.get(self.url, headers=self.headers, stream=True, 
+                                 timeout=self.timeout, allow_redirects=True)
             response.raise_for_status()
             
             # Open file in append mode to continue download
@@ -245,16 +318,36 @@ class DownloadThread(threading.Thread):
                 avg_speed = sum(self.speed_samples) / len(self.speed_samples) if self.speed_samples else 0
                 self.complete_callback(avg_speed)
                 
+        except requests.exceptions.ChunkedEncodingError as e:
+            # Handle incomplete read errors by retrying
+            if self.retry_count < self.max_retries:
+                self.retry_count += 1
+                logger.warning(f"ChunkedEncodingError occurred, retrying {self.retry_count}/{self.max_retries}")
+                time.sleep(1)  # Wait before retrying
+                self.run()  # Retry the download
+            else:
+                logger.error(f"Failed after {self.max_retries} retries: {str(e)}")
+                self.error_callback(f"Failed after {self.max_retries} retries: {str(e)}")
         except Exception as e:
+            logger.error(f"Download error: {str(e)}")
             self.error_callback(str(e))
     
     def calculate_chunk_size(self):
-        # Dynamic chunk sizing based on network speed
-        if self.speed > 0:
-            # Aim for chunks that take about 0.1 seconds to download
-            dynamic_size = max(1024, min(65536, int(self.speed * 0.1)))
-            return dynamic_size
-        return DEFAULT_CHUNK_SIZE
+        # Handle AUTO chunk size
+        if self.chunk_size_setting == "AUTO":
+            # Dynamic chunk sizing based on network speed
+            if self.speed > 0:
+                # Aim for chunks that take about 0.1 seconds to download
+                dynamic_size = max(65536, min(1048576, int(self.speed * 0.1)))
+                logger.debug(f"Auto chunk size: {dynamic_size} based on speed: {self.speed}")
+                return dynamic_size
+            return DEFAULT_CHUNK_SIZE
+        else:
+            # Use the fixed chunk size
+            try:
+                return int(self.chunk_size_setting)
+            except:
+                return DEFAULT_CHUNK_SIZE
     
     def stop(self):
         self._stop_event.set()
@@ -275,42 +368,44 @@ class DownloadThread(threading.Thread):
 class DownloadManager:
     def __init__(self):
         self.downloads = {}
-        self.config = self.load_config()
         self.db = DownloadDB()
+        self.config = self.load_config()
+        logger.info("DownloadManager initialized")
         
     def load_config(self):
-        default_config = {
-            "save_path": os.path.join(os.path.expanduser("~"), "Downloads"),
-            "max_connections": MAX_CONNECTIONS,
-            "chunk_size": DEFAULT_CHUNK_SIZE,
-            "timeout": 30,
-            "theme": "light",
-            "proxy": None
+        # Load settings from database instead of JSON
+        config = {
+            "save_path": self.db.get_setting("save_path") or os.path.join(os.path.expanduser("~"), "Downloads"),
+            "max_connections": int(self.db.get_setting("max_connections") or MAX_CONNECTIONS),
+            "chunk_size": self.db.get_setting("chunk_size") or DEFAULT_CHUNK_SIZE,
+            "timeout": int(self.db.get_setting("timeout") or 30),
+            "theme": self.db.get_setting("theme") or "light",
+            "proxy": self.db.get_setting("proxy") or None
         }
         
-        try:
-            if os.path.exists(CONFIG_FILE):
-                with open(CONFIG_FILE, 'r') as f:
-                    return {**default_config, **json.load(f)}
-        except:
-            pass
+        # Handle chunk_size being stored as string
+        if isinstance(config["chunk_size"], str) and config["chunk_size"].isdigit():
+            config["chunk_size"] = int(config["chunk_size"])
             
-        return default_config
+        logger.info(f"Loaded config: {config}")
+        return config
         
     def save_config(self):
-        try:
-            with open(CONFIG_FILE, 'w') as f:
-                json.dump(self.config, f, indent=4)
-        except:
-            pass
+        # Save settings to database instead of JSON
+        for key, value in self.config.items():
+            self.db.set_setting(key, value)
+        logger.info("Config saved to database")
             
     def get_file_size(self, url, headers=None):
         try:
             response = requests.head(url, headers=headers, allow_redirects=True, 
                                    timeout=self.config["timeout"])
             response.raise_for_status()
-            return int(response.headers.get('content-length', 0))
-        except:
+            size = int(response.headers.get('content-length', 0))
+            logger.info(f"File size for {url}: {size} bytes")
+            return size
+        except Exception as e:
+            logger.error(f"Error getting file size for {url}: {str(e)}")
             return 0
             
     def create_download(self, url, file_name=None, progress_callback=None, 
@@ -325,16 +420,18 @@ class DownloadManager:
         start_byte = 0
         if os.path.exists(temp_file_path):
             start_byte = os.path.getsize(temp_file_path)
+            logger.info(f"Resuming download from byte {start_byte}")
             
         file_size = self.get_file_size(url)
         
         # Headers
-        headers = {'User-Agent': 'FDM/1.0'}
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
         if self.config["proxy"]:
             headers['Proxy'] = self.config["proxy"]
             
         # Add to database
         db_id = self.db.add_download(url, file_name, self.config["save_path"])
+        logger.info(f"Added download to database with ID: {db_id}")
             
         # Create download thread
         thread = DownloadThread(
@@ -345,7 +442,8 @@ class DownloadManager:
             headers,
             self.config["timeout"],
             db_id,
-            self.db
+            self.db,
+            self.config["chunk_size"]
         )
         
         self.downloads[url] = {
@@ -381,6 +479,7 @@ class DownloadManager:
                 
                 # Update database
                 self.db.update_download_progress(download["db_id"], download["downloaded"], download["size"], "downloading")
+                logger.info(f"Started download: {url}")
     
     def recreate_thread(self, url):
         if url not in self.downloads:
@@ -393,7 +492,7 @@ class DownloadManager:
         current_downloaded = os.path.getsize(temp_file_path) if os.path.exists(temp_file_path) else 0
         
         # Headers
-        headers = {'User-Agent': 'FDM/1.0'}
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
         if self.config["proxy"]:
             headers['Proxy'] = self.config["proxy"]
             
@@ -406,11 +505,13 @@ class DownloadManager:
             headers,
             self.config["timeout"],
             download["db_id"],
-            self.db
+            self.db,
+            self.config["chunk_size"]
         )
         
         download["thread"] = thread
         download["downloaded"] = current_downloaded
+        logger.info(f"Recreated thread for {url}")
                 
     def pause_download(self, url):
         if url in self.downloads and self.downloads[url]["status"] == "downloading":
@@ -420,6 +521,7 @@ class DownloadManager:
             # Update database
             download = self.downloads[url]
             self.db.update_download_progress(download["db_id"], download["downloaded"], download["size"], "paused")
+            logger.info(f"Paused download: {url}")
             
     def resume_download(self, url):
         if url in self.downloads and self.downloads[url]["status"] == "paused":
@@ -429,6 +531,7 @@ class DownloadManager:
             # Update database
             download = self.downloads[url]
             self.db.update_download_progress(download["db_id"], download["downloaded"], download["size"], "downloading")
+            logger.info(f"Resumed download: {url}")
             
     def toggle_pause_resume(self, url):
         if url in self.downloads:
@@ -448,12 +551,14 @@ class DownloadManager:
             # Update database
             download = self.downloads[url]
             self.db.update_download_progress(download["db_id"], download["downloaded"], download["size"], "stopped")
+            logger.info(f"Stopped download: {url}")
             
     def remove_download(self, url):
         if url in self.downloads:
             if self.downloads[url]["status"] == "downloading":
                 self.stop_download(url)
             del self.downloads[url]
+            logger.info(f"Removed download: {url}")
             
     def on_download_complete(self, url, temp_path, final_path, complete_callback, avg_speed):
         if url in self.downloads:
@@ -464,8 +569,9 @@ class DownloadManager:
             try:
                 if os.path.exists(temp_path):
                     os.rename(temp_path, final_path)
-            except:
-                pass
+                    logger.info(f"Download completed: {url} -> {final_path}")
+            except Exception as e:
+                logger.error(f"Error renaming file: {str(e)}")
             
             # Update database
             download = self.downloads[url]
@@ -473,6 +579,15 @@ class DownloadManager:
                 
             if complete_callback:
                 complete_callback(url)
+                
+    def on_download_error(self, url, error):
+        if url in self.downloads:
+            self.downloads[url]["status"] = "error"
+            logger.error(f"Download error for {url}: {error}")
+            
+            # Update database
+            download = self.downloads[url]
+            self.db.update_download_progress(download["db_id"], download["downloaded"], download["size"], "error")
                 
     def update_progress(self, url, downloaded, speed):
         if url in self.downloads:
@@ -482,6 +597,8 @@ class DownloadManager:
     def load_downloads_from_db(self):
         """Load active downloads from database on startup"""
         active_downloads = self.db.get_active_downloads()
+        logger.info(f"Loading {len(active_downloads)} active downloads from database")
+        
         for download in active_downloads:
             db_id, url, filename, total_size, downloaded, status = download
             
@@ -489,7 +606,7 @@ class DownloadManager:
             temp_file_path = file_path + ".part"
             
             # Headers
-            headers = {'User-Agent': 'FDM/1.0'}
+            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
             if self.config["proxy"]:
                 headers['Proxy'] = self.config["proxy"]
                 
@@ -502,7 +619,8 @@ class DownloadManager:
                 headers,
                 self.config["timeout"],
                 db_id,
-                self.db
+                self.db,
+                self.config["chunk_size"]
             )
             
             self.downloads[url] = {
@@ -521,6 +639,7 @@ class DownloadManager:
             if status == "downloading":
                 # Start the download after a short delay to allow UI to initialize
                 threading.Timer(1.0, lambda: self.start_download(url)).start()
+                logger.info(f"Scheduled auto-resume for {url}")
 
 
 class ModernDownloader:
@@ -529,6 +648,22 @@ class ModernDownloader:
         self.root.title("FDM - Free Download Manager")
         self.root.geometry("900x600")
         self.root.minsize(800, 500)
+        
+        # Set window icon - handle both development and PyInstaller environments
+        try:
+            # Try to use the icon in the same directory
+            if hasattr(sys, '_MEIPASS'):
+                # PyInstaller creates a temporary directory in _MEIPASS
+                base_path = sys._MEIPASS
+                icon_path = os.path.join(base_path, "fdm.png")
+            else:
+                # Development environment
+                icon_path = "fdm.png"
+                
+            self.root.iconphoto(True, tk.PhotoImage(file=icon_path))
+            logger.info(f"Set window icon: {icon_path}")
+        except Exception as e:
+            logger.warning(f"Could not set window icon: {str(e)}")
         
         # Initialize download manager
         self.manager = DownloadManager()
@@ -564,6 +699,8 @@ class ModernDownloader:
         
         # Refresh UI periodically
         self.update_ui()
+        
+        logger.info("FDM application initialized")
         
     def setup_styles(self):
         self.style = ttk.Style()
@@ -629,18 +766,28 @@ class ModernDownloader:
         # Create a simple icon for the system tray
         self.tray_icon = None
         
-        # Generate an image for the tray icon
-        width = 64
-        height = 64
-        image = Image.new('RGB', (width, height), color='white')
-        dc = ImageDraw.Draw(image)
-        dc.rectangle([width//2-20, height//2-20, width//2+20, height//2+20], fill='green')
-        dc.text((width//2-10, height//2-5), "FDM", fill='white')
-        
-        # Convert to bytes
-        bio = io.BytesIO()
-        image.save(bio, format='PNG')
-        bio.seek(0)
+        try:
+            # Try to use the icon in the same directory
+            if hasattr(sys, '_MEIPASS'):
+                # PyInstaller creates a temporary directory in _MEIPASS
+                base_path = sys._MEIPASS
+                icon_path = os.path.join(base_path, "fdm.png")
+            else:
+                # Development environment
+                icon_path = "fdm.png"
+                
+            image = Image.open(icon_path)
+            image = image.resize((64, 64), Image.Resampling.LANCZOS)
+            logger.info(f"Using icon for tray: {icon_path}")
+        except:
+            # Fallback to generated icon if fdm.png is not available
+            logger.warning("Using fallback generated icon for tray")
+            width = 64
+            height = 64
+            image = Image.new('RGB', (width, height), color='white')
+            dc = ImageDraw.Draw(image)
+            dc.rectangle([width//2-20, height//2-20, width//2+20, height//2+20], fill='green')
+            dc.text((width//2-10, height//2-5), "FDM", fill='white')
         
         # Create menu for the tray icon
         menu = pystray.Menu(
@@ -649,17 +796,20 @@ class ModernDownloader:
         )
         
         # Create the tray icon
-        self.tray_icon = pystray.Icon('FDM', Image.open(bio), 'FDM Download Manager', menu)
+        self.tray_icon = pystray.Icon('FDM', image, 'FDM Download Manager', menu)
         
     def show_window(self, icon, item):
         self.root.after(0, self.root.deiconify)
+        logger.info("Showing window from tray")
         
     def quit_application(self, icon, item):
+        logger.info("Quitting application from tray")
         self.tray_icon.stop()
         self.root.destroy()
         
     def on_closing(self):
         # Hide the window instead of closing
+        logger.info("Hiding window to tray")
         self.root.withdraw()
         
     def create_ui(self):
@@ -828,29 +978,34 @@ class ModernDownloader:
         # Clear URL entry
         self.url_var.set("")
         
+        logger.info(f"Added download: {url}")
+        
     def get_progress_bar(self, percentage):
+        # Removed ANSI coloring which doesn't work in Tkinter
         bar_length = 20
         filled_length = int(bar_length * percentage / 100)
-        # Use green color for the completed part (using ANSI escape codes)
-        bar = '[' + '\033[92m' + '=' * filled_length + '\033[0m' + '>' + ' ' * (bar_length - filled_length) + ']'
+        bar = '[' + '=' * filled_length + '>' + ' ' * (bar_length - filled_length) + ']'
         return f"{bar} {percentage:.1f}%"
         
     def start_selected_downloads(self):
         for url in self.selected_urls:
             self.manager.start_download(url)
         self.update_pause_button_text()
+        logger.info(f"Started {len(self.selected_urls)} downloads")
             
     def pause_selected_downloads(self):
         for url in self.selected_urls:
             if url in self.manager.downloads and self.manager.downloads[url]["status"] == "downloading":
                 self.manager.pause_download(url)
         self.update_pause_button_text()
+        logger.info(f"Paused {len(self.selected_urls)} downloads")
             
     def stop_selected_downloads(self):
         for url in self.selected_urls:
             if url in self.manager.downloads:
                 self.manager.stop_download(url)
         self.update_pause_button_text()
+        logger.info(f"Stopped {len(self.selected_urls)} downloads")
             
     def remove_selected_downloads(self):
         for url in self.selected_urls:
@@ -861,6 +1016,7 @@ class ModernDownloader:
         self.details_text.config(state=tk.NORMAL)
         self.details_text.delete(1.0, tk.END)
         self.details_text.config(state=tk.DISABLED)
+        logger.info(f"Removed {len(self.selected_urls)} downloads")
             
     def update_pause_button_text(self):
         if self.selected_urls and all(url in self.manager.downloads for url in self.selected_urls):
@@ -926,6 +1082,8 @@ class ModernDownloader:
         if url in self.selected_urls:
             self.update_details()
             
+        logger.info(f"Download completed: {url}")
+            
     def on_download_error(self, url, error):
         if self.tree.exists(url):
             self.tree.set(url, "status", f"Error: {error[:20]}...")
@@ -934,6 +1092,8 @@ class ModernDownloader:
             
         if url in self.selected_urls:
             self.update_details()
+            
+        logger.error(f"Download error for {url}: {error}")
             
     def update_ui(self):
         # Update all downloads in the treeview
@@ -1032,11 +1192,11 @@ class ModernDownloader:
         connections_spin.grid(row=1, column=1, sticky=tk.W, pady=5)
 
         # Chunk size setting
-        ttk.Label(settings_frame, text="Chunk Size (bytes):").grid(row=2, column=0, sticky=tk.W, pady=5)
+        ttk.Label(settings_frame, text="Chunk Size:").grid(row=2, column=0, sticky=tk.W, pady=5)
         chunk_var = tk.StringVar(value=str(self.manager.config["chunk_size"]))
-        chunk_combo = ttk.Combobox(settings_frame, textvariable=chunk_var, values=[
-            "1024", "2048", "4096", "8192", "16384", "32768"
-        ], state="readonly", width=10)
+        chunk_combo = ttk.Combobox(settings_frame, textvariable=chunk_var, 
+                                  values=["AUTO", "1024", "2048", "4096", "8192", "16384", "32768", "65536", "131072"], 
+                                  state="readonly", width=10)
         chunk_combo.grid(row=2, column=1, sticky=tk.W, pady=5)
         
         # Timeout setting
@@ -1065,7 +1225,14 @@ class ModernDownloader:
         def save_settings():
             self.manager.config["save_path"] = path_var.get()
             self.manager.config["max_connections"] = int(connections_var.get())
-            self.manager.config["chunk_size"] = int(chunk_var.get())
+            
+            # Handle AUTO chunk size
+            chunk_val = chunk_var.get()
+            if chunk_val == "AUTO":
+                self.manager.config["chunk_size"] = "AUTO"
+            else:
+                self.manager.config["chunk_size"] = int(chunk_val)
+                
             self.manager.config["timeout"] = int(timeout_var.get())
             self.manager.config["proxy"] = proxy_var.get() or None
             self.manager.config["theme"] = theme_var.get()
@@ -1073,6 +1240,8 @@ class ModernDownloader:
             self.manager.save_config()
             self.apply_theme(theme_var.get())
             settings_window.destroy()
+            
+            logger.info("Settings saved")
             
         ttk.Button(buttons_frame, text="Save", command=save_settings, style="Accent.TButton").pack(side=tk.LEFT, padx=(0, 10))
         ttk.Button(buttons_frame, text="Cancel", command=settings_window.destroy).pack(side=tk.LEFT)
@@ -1084,17 +1253,24 @@ class ModernDownloader:
         current_theme = self.manager.config["theme"]
         new_theme = "dark" if current_theme == "light" else "light"
         self.apply_theme(new_theme)
+        logger.info(f"Toggled theme to {new_theme}")
 
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description='Free Download Manager')
     parser.add_argument('--silent', action='store_true', help='Start the application in silent mode (minimized to tray)')
+    parser.add_argument('--debug', action='store_true', help='Enable debug logging')
     return parser.parse_args()
 
 
 # Creating TK Container
 if __name__ == "__main__":
     args = parse_arguments()
+    
+    # Set logging level based on arguments
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+        logger.debug("Debug logging enabled")
     
     root = tk.Tk()
     app = ModernDownloader(root, silent_mode=args.silent)
@@ -1106,4 +1282,5 @@ if __name__ == "__main__":
     tray_thread = threading.Thread(target=run_tray_icon, daemon=True)
     tray_thread.start()
     
+    logger.info("Starting FDM main loop")
     root.mainloop()
