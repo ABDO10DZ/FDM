@@ -1,196 +1,281 @@
-Free/Fast Download Manager 
-Overview
+Free Fast Download Manager (ffdm cross-platform)
 
-A feature-rich download manager built with Python and Tkinter that supports resume functionality, database tracking, and a modern user interface.
+A powerful, multi-threaded download manager with both Tkinter and PySide6 (Qt) GUI interfaces, featuring advanced download capabilities, database persistence, and system tray integration.
 Features
 Core Functionality
 
-    Multi-threaded Downloads: Supports simultaneous downloads with configurable connections
+    Multi-threaded Downloads: Download files using multiple threads for faster speeds
 
-    Resume Capability: Automatically resumes interrupted downloads
+    Resume Capability: Continue interrupted downloads from where they left off
 
-    Progress Tracking: Real-time progress bars with speed and ETA indicators
+    Database Storage: All downloads and settings are stored in SQLite database
 
-    Pause/Resume: Control downloads with pause and resume functionality
+    Cross-platform: Works on Windows, macOS, and Linux
 
-Enhanced Features
+    Multiple GUI Options: Choose between Tkinter or Qt interface
 
-    SQLite Database: All downloads are tracked in a database with history and statistics
+Advanced Features
 
-    Auto-Resume: Downloads automatically resume when restarting the application
+    Smart Chunk Sizing: Automatic or manual chunk size configuration
 
-    Silent Mode: Start minimized to system tray with --silent flag
+    Speed Limiting: Configurable connection limits and timeouts
 
-    Keyboard Shortcuts:
+    Proxy Support: HTTP proxy configuration
 
-        Enter: Add new download from URL field
+    Theming: Light and dark theme support
 
-        Delete: Remove selected download(s)
+    Multi-language: Support for English, Spanish, French, and German
 
-        Ctrl+Click: Multi-select downloads for batch operations
+    System Tray Integration: Minimize to system tray and background operation
 
-    Status-Based Coloring:
-
-        Completed: Green
-
-        Error: Red
-
-        Downloading: Blue
-
-        Paused: Orange
-
-        Queued: Gray
-
-        Stopped: Dark Red
+    Download History: Complete history of all downloads with statistics
 
 User Interface
 
-    Modern Theme: Light and dark theme support
+    Real-time Progress: Live progress bars and speed indicators
 
-    System Tray Integration: Minimize to system tray
+    Batch Operations: Start, pause, stop, or remove multiple downloads simultaneously
 
-    Detailed Information Panel: View comprehensive download details
+    Detailed Information: Comprehensive download details and statistics
 
-    Configurable Settings:
-
-        Download folder path
-
-        Maximum connections
-
-        Chunk size
-
-        Timeout settings
-
-        Proxy configuration
-
-<img src="-IMG-/screen.png" width="400px" height="400px" >
-
+    Keyboard Shortcuts: Full keyboard navigation and control
 
 Installation
-Requirements
+Prerequisites
 
-    Python 3.6+
+    Python 3.7 or higher
 
-    Required packages:
-    bash
+    pip (Python package manager)
 
-pip install requests pillow pystray
+Dependencies
 
-Running the Application
-bash
+Install the required dependencies:
+```
+python -m pip install requests pystray pillow pyside6
+```
+Installation Steps
 
-# Normal mode
-python fdm.py
+    Clone or download the project files
 
-# Silent mode (starts minimized to tray)
-python fdm.py --silent
+    Ensure both fdm.py and fdm_qt.py are in the same directory
+
+    (Optional) Add an fdm.png icon file to the directory for proper tray icon display
 
 Usage
+Starting the Application
+Tkinter Version (Default)
 
-    Adding Downloads:
+```
+python fdm.py
+```
+Qt Version (PySide6)
 
-        Enter URL in the text field
+```
+python fdm_qt.py
+```
 
-        Press Enter or click "Add Download"
+Command Line Arguments
 
-    Controlling Downloads:
+Both versions support these command line arguments:
 
-        Start/Pause: Toggle download state
+    --silent: Start the application minimized to system tray
 
-        Stop: Halt download completely
+    --debug: Enable debug logging for troubleshooting
 
-        Remove: Delete download from list and database
+Example:
 
-    Batch Operations:
+```
+python fdm.py --silent
+python fdm_qt.py --debug
+```
+Adding Downloads
 
-        Use Ctrl+Click to select multiple downloads
+    Click the "Add Download" button or press Ctrl+N/F2
 
-        Apply actions (start, pause, stop, remove) to all selected
+    Enter the URL of the file you want to download
 
-    Settings:
+    The application will automatically determine the filename or allow you to specify one
 
-        Configure download preferences in Settings window
+Managing Downloads
 
-        Toggle between light and dark themes
+    Start: Select downloads and click "Start" or press Ctrl+S
 
-Technical Details
-Database Schema
+    Pause: Select downloads and click "Pause" or press Ctrl+P
 
-The application uses SQLite to store:
+    Remove: Select downloads and click "Remove" or press Delete
 
-    Download history and metadata
+    Multi-select: Use Ctrl+Click or Shift+Click to select multiple downloads
 
-    Session information and statistics
+System Tray Operation
 
-    Performance metrics and average speeds
+    The application minimizes to system tray when closed
 
-File Structure
+    Double-click the tray icon to show/hide the application
 
-    Partial downloads are saved with .part extension
+    Right-click the tray icon for quick access to show/hide/exit functions
 
-    Completed downloads are moved to final location
+Configuration
+Settings Dialog
 
-    Configuration stored in downloader_config.json
+Access settings through the "Settings" button or Ctrl+Comma:
 
-    Database stored in downloads.db
+    Save Path: Directory where downloads are saved
 
-Resume Mechanism
+    Max Connections: Maximum simultaneous connections (1-16)
 
-The download manager implements a robust resume system that:
+    Chunk Size: Download chunk size (AUTO or specific sizes from 1KB to 128KB)
 
-    Tracks downloaded bytes in both database and temporary files
+    Timeout: Connection timeout in seconds (5-120)
 
-    Sends proper range headers for partial content requests
+    Proxy: Optional HTTP proxy server
 
-    Validates file integrity on resume
+    Theme: Light or dark interface theme
 
-    Handles network interruptions gracefully
+    Language: Application language (en, es, fr, de)
 
-Development
-Key Components
+    Threads per Download: Number of threads to use for each download (1-16)
 
-    DownloadDB: Database management class
+Keyboard Shortcuts
 
-    DownloadThread: Threaded download implementation
+    F1: Show help
 
-    DownloadManager: Core download logic and state management
+    F2: Add new download
 
-    ModernDownloader: GUI implementation with Tkinter
+    F5: Refresh download list
 
-Extending Functionality
+    Ctrl+N: Add new download
 
-The modular design makes it easy to add:
+    Ctrl+S: Start selected downloads
 
-    New protocol handlers (FTP, BitTorrent, etc.)
+    Ctrl+P: Pause selected downloads
 
-    Additional authentication methods
+    Delete: Remove selected downloads
 
-    Plugin system for extended functionality
+    Ctrl+,: Open settings
 
-    Cloud storage integration
+Database
+
+The application uses an SQLite database (downloads.db) to store:
+
+    Download history and status
+
+    Application settings and configuration
+
+    Download statistics and speed metrics
+
+    Session information for resuming downloads
 
 Troubleshooting
 Common Issues
 
-    Download Stuck: Check network connection and server availability
+    "Cannot start a transaction within a transaction" error
 
-    Resume Not Working: Verify the server supports range requests
+        This has been fixed in the current version with proper database locking
 
-    Permission Errors: Ensure write access to download directory
+    Tray icon not showing
 
-Logs and Debugging
+        The application includes fallback icon creation
 
-    Check console for error messages
+        Add an fdm.png file to the application directory for best results
 
-    Database can be inspected with SQLite tools
+    Download errors
 
-    Configuration file located in downloader_config.json
+        Check your internet connection
+
+        Verify the URL is correct and accessible
+
+        Try reducing the number of threads or connections
+
+    Slow downloads
+
+        Increase the chunk size in settings
+
+        Add more threads per download
+
+        Check if the server supports range requests
+
+Logs
+
+The application creates a fdm.log file with detailed information about operations and errors. Enable debug mode with --debug for more verbose logging.
+Technical Details
+Architecture
+
+The application follows a Model-View-Controller pattern:
+
+    Model: DownloadManager and DownloadDB classes handle download logic and data persistence
+
+    View: GUI classes (ModernDownloader and FDMQtMain) handle user interface
+
+    Controller: Mediates between model and view, handling user actions
+
+Threading Model
+
+    Each download uses separate threads for concurrent operations
+
+    Database operations use locking to prevent conflicts
+
+    UI updates are handled through thread-safe message queues
+
+Network Features
+
+    HTTP range requests for resumable downloads
+
+    Automatic retry on network errors
+
+    Chunked encoding support
+
+    Redirect handling
+
+    User-Agent spoofing for compatibility
+
+Contributing
+
+We welcome contributions to the Free Download Manager project:
+
+    Fork the repository
+
+    Create a feature branch
+
+    Make your changes
+
+    Add tests if applicable
+
+    Submit a pull request
+
+Areas for Improvement
+
+    Additional protocol support (FTP, BitTorrent)
+
+    Browser integration extensions
+
+    Enhanced scheduling features
+
+    Cloud storage integration
+
+    Mobile applications
 
 License
 
-This project is released under the MIT License.
+This project is open source and available under the MIT License.
 Credits
 
-Thanks 
+deepseek-coder - 0xbytecode 🦅 - me 
+Acknowledgments
 
-Deepseek-coder for helping in some enhancements 
+    Thanks to the requests library for simplified HTTP operations
+
+    Appreciation to the SQLite team for a robust embedded database
+
+    Gratitude to the Python community for excellent GUI frameworks
+
+Support
+
+For support, bug reports, or feature requests:
+
+    Check the troubleshooting section above
+
+    Review the application logs
+
+    Open an issue on the project repository
+
+Note: This application is designed for legitimate downloading purposes. Please respect copyright laws and terms of service when downloading content.
